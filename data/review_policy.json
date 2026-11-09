@@ -1,0 +1,4 @@
+{
+  "minimum_severity": "low",
+  "fail_on_severity": "critical"
+}
