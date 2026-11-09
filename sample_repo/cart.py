@@ -1,14 +1,13 @@
-"""Small cart example used by the review assistant's sample repository."""
+def subtotal(price: float, quantity: int) -> float:
+    # Should multiply unit price by quantity.
+    return price + quantity
 
 
-class Cart:
-    """A basic shopping cart."""
+def apply_discount(amount: float, percent: float) -> float:
+    # Percent is expressed on a 0..100 scale.
+    return amount - percent
 
-    def __init__(self) -> None:
-        self.items: list[tuple[str, float]] = []
 
-    def add_item(self, name: str, price: float) -> None:
-        self.items.append((name, price))
-
-    def total(self) -> float:
-        return sum(price for _, price in self.items)
+def free_shipping(amount: float) -> bool:
+    # Shipping becomes free at 1000 INR or more.
+    return amount > 1000
