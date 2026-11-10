@@ -1,4 +1,23 @@
 {
-  "minimum_severity": "low",
-  "fail_on_severity": "critical"
+  "version": "v1",
+  "required_stages": [
+    "correctness",
+    "security",
+    "testing"
+  ],
+  "block_if_test_fails": true,
+  "block_if_confirmed_critical": true,
+  "unknown_check_policy": "NEEDS_HUMAN_REVIEW",
+  "severity_levels": [
+    "LOW",
+    "MEDIUM",
+    "HIGH",
+    "CRITICAL"
+  ],
+  "evidence_required_for_findings": [
+    "existing_file",
+    "valid_line_number",
+    "tool_or_test_reference"
+  ],
+  "write_access": false
 }
