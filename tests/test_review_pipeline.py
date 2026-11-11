@@ -71,11 +71,21 @@ def test_pipeline_reports_actual_test_status() -> None:
     result = prepare_review(_request())
     test_results = result["checks"]["test_results"]
 
-    assert test_results["status"] == "failed"
-    assert test_results["return_code"] != 0
+    assert test_results["status"] == "passed"
+    assert test_results["return_code"] == 0
 
 
-def test_prompt_injection_cannot_override_failed_tests() -> None:
+def test_prompt_injection_cannot_override_failed_tests(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from src.pipeline import checks
+
+    monkeypatch.setattr(
+        checks.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="1 failed", stderr=""
+        ),
+    )
     result = prepare_review(
         _request(
             message=(

@@ -3,6 +3,7 @@
 my_venv/
 .venv/
 env/
+/autogen/
 
 # Environment secrets
 .env

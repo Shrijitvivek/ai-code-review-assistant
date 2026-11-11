@@ -74,7 +74,9 @@ def test_loaded_request_passes_directly_to_existing_pipeline(monkeypatch, review
     path = Path(__file__).resolve().parents[1] / "data" / "review_requests.json"
     request = load_request(path, review_id)
     result = prepare_review(request)
-    assert set(result) == {"inventory", "static_analysis", "test_results"}
+    # The current pipeline returns request metadata, the check results, and
+    # release-gate output alongside these three check fields.
+    assert {"inventory", "static_analysis", "test_results"} <= result.keys()
     assert result["test_results"]["status"] == "passed"
     assert len(calls) == 1  # Even R004's message cannot suppress the test check.
     expected = "unavailable" if review_id == "R003" else "completed"
