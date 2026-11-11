@@ -1,18 +1,9 @@
-
-# LangChain
+# Framework dependencies and deterministic testing tools.
 langchain-core>=1.7.4,<2.0.0
 langchain-openai>=1.6.3,<2.0.0
-
-# AutoGen - modern AgentChat API
 autogen-agentchat==0.7.5
 autogen-ext[openai]==0.7.5
-
-# Data validation
-pydantic>=2.12,<3.0
-
-# Environment configuration
+pydantic==2.13.4
 python-dotenv>=1.2,<2.0
-
-# Testing
-pytest>=8.0,<10.0
+pytest==8.3.5
 pytest-asyncio>=1.0,<2.0
