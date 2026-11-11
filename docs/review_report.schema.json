@@ -1,0 +1,172 @@
+{
+  "$defs": {
+    "Category": {
+      "enum": [
+        "correctness",
+        "security",
+        "testing"
+      ],
+      "title": "Category",
+      "type": "string"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "title": "File",
+          "type": "string"
+        },
+        "line": {
+          "minimum": 1,
+          "title": "Line",
+          "type": "integer"
+        },
+        "category": {
+          "$ref": "#/$defs/Category"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/FindingStatus"
+        },
+        "fix": {
+          "minLength": 1,
+          "title": "Fix",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "line",
+        "category",
+        "severity",
+        "description",
+        "evidence",
+        "status",
+        "fix"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "FindingStatus": {
+      "enum": [
+        "confirmed",
+        "unverified"
+      ],
+      "title": "FindingStatus",
+      "type": "string"
+    },
+    "ReleaseDecision": {
+      "enum": [
+        "PASS",
+        "BLOCK",
+        "NEEDS_HUMAN_REVIEW"
+      ],
+      "title": "ReleaseDecision",
+      "type": "string"
+    },
+    "ScanStatus": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "failed"
+      ],
+      "title": "ScanStatus",
+      "type": "string"
+    },
+    "Severity": {
+      "description": "Relative impact of a review finding.",
+      "enum": [
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+        "CRITICAL"
+      ],
+      "title": "Severity",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "review_id": {
+      "minLength": 1,
+      "title": "Review Id",
+      "type": "string"
+    },
+    "commit_id": {
+      "minLength": 1,
+      "title": "Commit Id",
+      "type": "string"
+    },
+    "scan_status": {
+      "$ref": "#/$defs/ScanStatus"
+    },
+    "tests_passed": {
+      "minimum": 0,
+      "title": "Tests Passed",
+      "type": "integer"
+    },
+    "tests_failed": {
+      "minimum": 0,
+      "title": "Tests Failed",
+      "type": "integer"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "title": "Findings",
+      "type": "array"
+    },
+    "release_decision": {
+      "$ref": "#/$defs/ReleaseDecision"
+    },
+    "blockers": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Blockers",
+      "type": "array"
+    },
+    "missing_checks": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Missing Checks",
+      "type": "array"
+    },
+    "reviewer_summary": {
+      "minLength": 1,
+      "title": "Reviewer Summary",
+      "type": "string"
+    }
+  },
+  "required": [
+    "review_id",
+    "commit_id",
+    "scan_status",
+    "tests_passed",
+    "tests_failed",
+    "release_decision",
+    "reviewer_summary"
+  ],
+  "title": "ReviewResult",
+  "type": "object"
+}
