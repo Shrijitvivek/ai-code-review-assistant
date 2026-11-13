@@ -1,7 +1,7 @@
 """Top-level review workflow orchestration."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnableSequence
@@ -31,7 +31,7 @@ def _route_review_context(context: Mapping[str, object]) -> dict[str, object]:
     return {**context, **route}
 
 
-def _load_review_policy() -> Mapping[str, object]:
+def load_review_policy() -> Mapping[str, object]:
     """Load the configured release policy without supplying implicit defaults."""
     policy_path = Path(__file__).resolve().parents[2] / "data" / "review_policy.json"
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
@@ -53,19 +53,63 @@ def _finalize_review(results: Mapping[str, object]) -> dict[str, object]:
     }
     static_analysis = checks["static_analysis"]
     findings_value = (
-        static_analysis.get("findings", [])
+        static_analysis.get("findings")
         if isinstance(static_analysis, Mapping)
-        else []
+        else None
     )
-    findings = (
-        list(findings_value)
-        if isinstance(findings_value, (list, tuple))
-        else []
+    findings_are_valid = (
+        isinstance(findings_value, Sequence)
+        and not isinstance(findings_value, (str, bytes))
+        and all(isinstance(finding, Mapping) for finding in findings_value)
     )
-    evidence_validation = validate_findings(findings)
+    if findings_are_valid:
+        findings: object = list(findings_value)
+    else:
+        findings = findings_value
+        error = "Static analysis returned malformed or unavailable findings."
+        if isinstance(static_analysis, Mapping):
+            checks["static_analysis"] = {
+                **static_analysis,
+                "status": "unavailable",
+                "error": static_analysis.get("error") or error,
+            }
+        else:
+            checks["static_analysis"] = {
+                "status": "unavailable",
+                "error": error,
+                "result": static_analysis,
+            }
+    trusted_references = (
+        {
+            reference
+            for finding in findings_value
+            if isinstance(finding, Mapping)
+            for reference in (finding.get("tool_reference"),)
+            if isinstance(reference, str) and reference.strip()
+        }
+        if findings_are_valid
+        else set()
+    )
+    evidence_validation = validate_findings(
+        findings,
+        allowed_references=trusted_references,
+    )
 
     test_results = checks["test_results"]
+    inventory = checks["inventory"]
+    static_analysis = checks["static_analysis"]
+    source_scan_complete = (
+        isinstance(inventory, Mapping)
+        and inventory.get("status") == "completed"
+        and isinstance(static_analysis, Mapping)
+        and static_analysis.get("status") == "completed"
+        and findings_are_valid
+        and not context.get("missing_files")
+    )
     stages: dict[str, object] = {
+        "source_scan": {
+            "status": "completed" if source_scan_complete else "unavailable"
+        },
         "correctness": {"status": "unavailable"},
         "security": {"status": "unavailable"},
         "testing": test_results,
@@ -77,7 +121,7 @@ def _finalize_review(results: Mapping[str, object]) -> dict[str, object]:
         "findings": findings,
         "evidence_validation": evidence_validation,
     }
-    release = evaluate_release(release_results, _load_review_policy())
+    release = evaluate_release(release_results, load_review_policy())
 
     return {
         **context,

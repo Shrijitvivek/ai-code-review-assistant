@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from autogen_core.tools import FunctionTool
+
 
 _MAX_OUTPUT_CHARACTERS = 12_000
 
@@ -65,3 +67,12 @@ def run_repository_tests() -> str:
         "stdout": result.stdout[-_MAX_OUTPUT_CHARACTERS:],
         "stderr": result.stderr[-_MAX_OUTPUT_CHARACTERS:],
     })
+
+
+def repository_test_tool() -> FunctionTool:
+    """Return the fixed test runner as a strict AutoGen function tool."""
+    return FunctionTool(
+        run_repository_tests,
+        description=run_repository_tests.__doc__ or "",
+        strict=True,
+    )

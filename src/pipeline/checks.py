@@ -70,6 +70,19 @@ def run_static_analysis(context: Mapping[str, object]) -> CheckResult:
         visitor.visit(tree)
         findings.extend(visitor.findings)
 
+    for finding in findings:
+        commit_id = context.get("commit_id")
+        reference_parts = [
+            "static_analysis",
+            str(commit_id) if isinstance(commit_id, str) else None,
+            str(finding["rule"]),
+            str(finding["file"]),
+            str(finding["line"]),
+        ]
+        finding["tool_reference"] = (
+            ":".join(part for part in reference_parts if part is not None)
+        )
+
     return {"status": "completed", "findings": findings, "error": None}
 
 
@@ -79,6 +92,37 @@ def execute_repository_tests(context: Mapping[str, object]) -> CheckResult:
         return {
             "status": "unavailable",
             "error": "Review context must be a mapping.",
+            "missing_files": [],
+        }
+
+    raw_missing_files = context.get("missing_files", [])
+    missing_files = (
+        list(raw_missing_files)
+        if isinstance(raw_missing_files, (list, tuple))
+        and all(isinstance(path, str) for path in raw_missing_files)
+        else []
+    )
+    selected_files = context.get("files")
+    if not isinstance(selected_files, (list, tuple)) or not selected_files:
+        return {
+            "status": "unavailable",
+            "error": "No valid selected source files are available for this review.",
+            "missing_files": missing_files,
+        }
+
+    try:
+        selected_sources = _read_selected_sources(context)
+    except (OSError, TypeError, UnicodeError, ValueError) as error:
+        return {
+            "status": "unavailable",
+            "error": f"Selected review sources are unavailable: {error}",
+            "missing_files": missing_files,
+        }
+    if not selected_sources:
+        return {
+            "status": "unavailable",
+            "error": "No valid selected source files are available for this review.",
+            "missing_files": missing_files,
         }
 
     try:
@@ -87,6 +131,7 @@ def execute_repository_tests(context: Mapping[str, object]) -> CheckResult:
         return {
             "status": "unavailable",
             "error": f"Unable to resolve the sample repository: {error}",
+            "missing_files": missing_files,
         }
 
     test_file = (repository_root / "test_cart.py").resolve(strict=False)
@@ -94,9 +139,14 @@ def execute_repository_tests(context: Mapping[str, object]) -> CheckResult:
         return {
             "status": "unavailable",
             "error": "The fixed test target sample_repo/test_cart.py is unavailable.",
+            "missing_files": missing_files,
         }
     if importlib.util.find_spec("pytest") is None:
-        return {"status": "unavailable", "error": "pytest is not installed."}
+        return {
+            "status": "unavailable",
+            "error": "pytest is not installed.",
+            "missing_files": missing_files,
+        }
 
     test_env = os.environ.copy()
     test_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -125,11 +175,13 @@ def execute_repository_tests(context: Mapping[str, object]) -> CheckResult:
             "timed_out": True,
             "stdout": _as_text(error.stdout),
             "stderr": _as_text(error.stderr),
+            "missing_files": missing_files,
         }
     except OSError as error:
         return {
             "status": "unavailable",
             "error": f"Unable to start pytest: {error}",
+            "missing_files": missing_files,
         }
 
     return {
@@ -138,6 +190,7 @@ def execute_repository_tests(context: Mapping[str, object]) -> CheckResult:
         "stdout": result.stdout,
         "stderr": result.stderr,
         "error": None if result.returncode == 0 else "pytest reported a failure.",
+        "missing_files": missing_files,
     }
 
 

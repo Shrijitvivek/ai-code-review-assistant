@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+
+from autogen_core.tools import FunctionTool
 
 from src.models.review_models import validate_source_path
 
@@ -60,9 +61,25 @@ def read_repository_file(relative_path: str) -> str:
             "content": content[:_MAX_FILE_CHARACTERS],
             "limit": _MAX_FILE_CHARACTERS,
         })
-    return json.dumps({"status": "ok", "path": relative_path, "content": content})
+    return json.dumps({
+        "status": "ok",
+        "path": relative_path,
+        "content": content,
+        "tool_reference": f"read_repository_file:{relative_path}",
+    })
 
 
-def repository_read_tools() -> list[Any]:
+def repository_read_tools() -> list[FunctionTool]:
     """Return the fixed set of read-only tools usable by reviewer agents."""
-    return [list_repository_files, read_repository_file]
+    return [
+        FunctionTool(
+            list_repository_files,
+            description=list_repository_files.__doc__ or "",
+            strict=True,
+        ),
+        FunctionTool(
+            read_repository_file,
+            description=read_repository_file.__doc__ or "",
+            strict=True,
+        ),
+    ]

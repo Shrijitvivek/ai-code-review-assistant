@@ -4,7 +4,7 @@ This module only checks file paths, line numbers, and supporting references.
 It never executes repository code or interprets source comments.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path, PureWindowsPath
 
 
@@ -67,6 +67,18 @@ def _validate_file_path(value: object) -> tuple[dict[str, object], Path | None]:
             None,
         )
 
+    if candidate.suffix.casefold() != ".py":
+        return (
+            {
+                "file_path_is_relative": relative_check,
+                "file_exists": _check_result(False, "Only Python source files may be cited."),
+                "file_is_inside_repository": _check_result(
+                    False, "Only Python source files may be cited."
+                ),
+            },
+            None,
+        )
+
     try:
         resolved = (_SAMPLE_REPOSITORY / candidate).resolve(strict=False)
     except (OSError, RuntimeError) as error:
@@ -121,7 +133,11 @@ def _validate_file_path(value: object) -> tuple[dict[str, object], Path | None]:
     )
 
 
-def validate_finding(finding: Mapping[str, object]) -> dict[str, object]:
+def validate_finding(
+    finding: Mapping[str, object],
+    *,
+    allowed_references: Collection[str] | None = None,
+) -> dict[str, object]:
     """Validate one mapping-based finding against ``sample_repo``.
 
     Findings use ``file_path`` (or ``file``) and ``line`` (or ``line_number``).
@@ -201,6 +217,14 @@ def validate_finding(finding: Mapping[str, object]) -> dict[str, object]:
         if has_reference
         else "A non-empty supporting tool or test reference is required.",
     )
+    if allowed_references is not None:
+        reference_is_trusted = has_reference and reference in allowed_references
+        checks["supporting_reference_is_trusted"] = _check_result(
+            reference_is_trusted,
+            None
+            if reference_is_trusted
+            else "The supporting reference does not match a trusted tool or test result.",
+        )
 
     failure_reasons = [
         f"{name}: {check['reason']}"
@@ -218,6 +242,8 @@ def validate_finding(finding: Mapping[str, object]) -> dict[str, object]:
 
 def validate_findings(
     findings: Sequence[Mapping[str, object]],
+    *,
+    allowed_references: Collection[str] | None = None,
 ) -> dict[str, object]:
     """Validate a sequence of findings and return per-finding and aggregate results.
 
@@ -245,7 +271,10 @@ def validate_findings(
             "failure_reasons": [],
         }
 
-    results = [validate_finding(finding) for finding in findings]
+    results = [
+        validate_finding(finding, allowed_references=allowed_references)
+        for finding in findings
+    ]
     all_verified = all(result["verified"] for result in results)
     failures = [
         f"Finding {index}: {reason}"

@@ -77,7 +77,12 @@ def test_loaded_request_passes_directly_to_existing_pipeline(monkeypatch, review
     # The current pipeline returns request metadata, the check results, and
     # release-gate output alongside these three check fields.
     assert {"inventory", "static_analysis", "test_results"} <= result.keys()
-    assert result["test_results"]["status"] == "passed"
-    assert len(calls) == 1  # Even R004's message cannot suppress the test check.
+    if review_id == "R003":
+        assert result["test_results"]["status"] == "unavailable"
+        assert result["test_results"]["missing_files"] == ["missing.py"]
+        assert calls == []
+    else:
+        assert result["test_results"]["status"] == "passed"
+        assert len(calls) == 1  # Request text cannot suppress the fixed test check.
     expected = "unavailable" if review_id == "R003" else "completed"
     assert result["inventory"]["status"] == expected

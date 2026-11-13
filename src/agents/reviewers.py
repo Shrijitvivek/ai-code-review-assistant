@@ -12,8 +12,13 @@ from src.agents.prompts import (
     SECURITY_REVIEWER_PROMPT,
     TEST_ANALYST_PROMPT,
 )
+from src.models.review_models import (
+    ReviewerReport,
+    SynthesizedReport,
+    TestAnalystReport,
+)
 from src.tools.repository_tools import repository_read_tools
-from src.tools.test_runner import run_repository_tests
+from src.tools.test_runner import repository_test_tool
 
 
 def CorrectnessReviewer(model_client: Any) -> AssistantAgent:
@@ -23,6 +28,7 @@ def CorrectnessReviewer(model_client: Any) -> AssistantAgent:
         model_client=model_client,
         system_message=CORRECTNESS_REVIEWER_PROMPT,
         tools=repository_read_tools(),
+        output_content_type=ReviewerReport,
         max_tool_iterations=3,
     )
 
@@ -34,6 +40,7 @@ def SecurityReviewer(model_client: Any) -> AssistantAgent:
         model_client=model_client,
         system_message=SECURITY_REVIEWER_PROMPT,
         tools=repository_read_tools(),
+        output_content_type=ReviewerReport,
         max_tool_iterations=3,
     )
 
@@ -44,7 +51,8 @@ def TestAnalyst(model_client: Any) -> AssistantAgent:
         name="TestAnalyst",
         model_client=model_client,
         system_message=TEST_ANALYST_PROMPT,
-        tools=[*repository_read_tools(), run_repository_tests],
+        tools=[*repository_read_tools(), repository_test_tool()],
+        output_content_type=TestAnalystReport,
         max_tool_iterations=3,
     )
 
@@ -55,4 +63,5 @@ def ReportSynthesizer(model_client: Any) -> AssistantAgent:
         name="ReportSynthesizer",
         model_client=model_client,
         system_message=REPORT_SYNTHESIZER_PROMPT,
+        output_content_type=SynthesizedReport,
     )

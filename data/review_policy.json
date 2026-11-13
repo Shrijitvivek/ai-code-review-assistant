@@ -1,6 +1,7 @@
 {
   "version": "v1",
   "required_stages": [
+    "source_scan",
     "correctness",
     "security",
     "testing"

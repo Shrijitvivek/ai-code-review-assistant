@@ -1,6 +1,6 @@
 ﻿"""Validated Group 3 input and output contracts (Pydantic v2)."""
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Annotated
+from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 from .enums import Category, FindingStatus, ReleaseDecision, ScanStatus, Severity
 
@@ -45,7 +45,25 @@ class Finding(Contract):
     evidence: list[Text] = Field(min_length=1)
     status: FindingStatus
     fix: Text
+    tool_reference: Text | None = None
+    test_reference: Text | None = None
     _source_path = field_validator("file")(validate_source_path)
+
+
+class ReviewerReport(Contract):
+    findings: list[Finding]
+    reviewer_summary: Text
+
+
+class TestAnalystReport(Contract):
+    test_status: Literal["passed", "failed", "unavailable"]
+    test_evidence: Text
+
+
+class SynthesizedReport(Contract):
+    findings: list[Finding]
+    reviewer_summary: Text
+    test_status: Literal["passed", "failed", "unavailable", "unknown"]
 
 
 class ReviewResult(Contract):

@@ -2,6 +2,7 @@
 from src.data.request_loader import (deduplicate_findings, resolve_source,
                                      validate_finding_location, load_requests)
 from src.models.review_models import Finding, ReviewRequest
+from src.release.evidence_validator import validate_finding
 
 
 @pytest.mark.parametrize("path", ["../secret.py", "/etc/x.py", "C:/x.py",
@@ -24,6 +25,47 @@ def test_evidence_line_check(tmp_path):
         validate_finding_location(finding(line=2), tmp_path)
     with pytest.raises(FileNotFoundError):
         validate_finding_location(finding(file="missing.py"), tmp_path)
+
+
+def test_evidence_validator_rejects_untrusted_reference():
+    finding_data = dict(
+        file="cart.py",
+        line=1,
+        category="correctness",
+        severity="HIGH",
+        description="Incorrect total",
+        evidence=["source:1"],
+        status="confirmed",
+        fix="Multiply unit price by quantity",
+        tool_reference="invented:cart.py",
+    )
+
+    result = validate_finding(
+        finding_data,
+        allowed_references={"read_repository_file:cart.py"},
+    )
+
+    assert result["verified"] is False
+    assert result["checks"]["supporting_reference_is_trusted"]["passed"] is False
+
+
+def test_evidence_validator_rejects_non_python_paths():
+    finding_data = dict(
+        file="readme.txt",
+        line=1,
+        category="correctness",
+        severity="LOW",
+        description="Invalid source path",
+        evidence=["tool:readme.txt"],
+        status="unverified",
+        fix="Cite a Python source file",
+        tool_reference="tool:readme.txt",
+    )
+
+    result = validate_finding(finding_data)
+
+    assert result["verified"] is False
+    assert result["checks"]["file_exists"]["passed"] is False
 
 
 def test_duplicates_preserve_evidence_without_mutation():
