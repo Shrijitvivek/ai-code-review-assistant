@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Mapping, MutableMapping, Sequence
 
 from pydantic import BaseModel
 
-from src.data.request_loader import deduplicate_findings
+from src.data.request_loader import deduplicate_findings, load_request, load_requests
 from src.agents.review_team import (
     extract_reviewer_report,
     extract_synthesized_report,
@@ -17,8 +19,7 @@ from src.agents.review_team import (
     extract_test_runner_status,
     run_review_team,
 )
-from src.data.request_loader import load_requests
-from src.models.review_models import Finding
+from src.models.review_models import Finding, ReviewResult
 from src.pipeline.review_pipeline import load_review_policy, prepare_review
 from src.release.evidence_validator import validate_findings
 from src.release.release_gate import evaluate_release
@@ -35,6 +36,7 @@ _REVIEWER_NAMES = (
     "ReportSynthesizer",
 )
 _COMPLETED_STATUSES = {"complete", "completed", "passed", "success", "successful"}
+_MAX_CONCURRENT_REVIEWS = 4
 
 
 def _error_message(error: Exception) -> str:
@@ -55,7 +57,25 @@ def _status(value: object) -> str | None:
 def _read_tool_references(
     messages: list[object], reviewer: str
 ) -> dict[str, str]:
-    references: dict[str, str] = {}
+    return {
+        path: result["tool_reference"]
+        for path, result in _read_tool_results(messages, reviewer).items()
+        if isinstance(result.get("tool_reference"), str)
+    }
+
+
+def _read_tool_sources(messages: list[object], reviewer: str) -> dict[str, str]:
+    return {
+        path: result["content"]
+        for path, result in _read_tool_results(messages, reviewer).items()
+        if isinstance(result.get("content"), str)
+    }
+
+
+def _read_tool_results(
+    messages: list[object], reviewer: str
+) -> dict[str, Mapping[str, object]]:
+    tool_results: dict[str, Mapping[str, object]] = {}
     for message in messages:
         if getattr(message, "source", None) != reviewer:
             continue
@@ -82,8 +102,92 @@ def _read_tool_references(
                 and isinstance(path, str)
                 and reference == f"read_repository_file:{path}"
             ):
-                references[path] = reference
-    return references
+                tool_results[path] = tool_result
+    return tool_results
+
+
+def _correct_finding_lines(
+    findings: object, sources: Mapping[str, str]
+) -> list[dict[str, int]] | None:
+    if not isinstance(findings, list):
+        return None
+    corrections: list[dict[str, int]] = []
+    for finding in findings:
+        if not isinstance(finding, MutableMapping):
+            return None
+        path = finding.get("file")
+        line = finding.get("line")
+        evidence = finding.get("evidence")
+        source = sources.get(path) if isinstance(path, str) else None
+        if (
+            not isinstance(source, str)
+            or not isinstance(line, int)
+            or isinstance(line, bool)
+            or not isinstance(evidence, list)
+            or not all(isinstance(item, str) for item in evidence)
+        ):
+            return None
+        lines = source.splitlines()
+        normalized_evidence = [" ".join(item.split()) for item in evidence]
+        matching_lines = [
+            line_number
+            for line_number, source_line in enumerate(lines, start=1)
+            if source_line.strip()
+            and not source_line.lstrip().startswith("#")
+            and any(
+                " ".join(source_line.split()) in excerpt
+                for excerpt in normalized_evidence
+            )
+        ]
+        if not matching_lines or (
+            len(matching_lines) > 1 and line not in matching_lines
+        ):
+            return None
+        actual_line = line if line in matching_lines else matching_lines[0]
+        source_line = lines[actual_line - 1].strip()
+        if source_line.startswith(("def ", "async def ", "class ", '"""', "'''")):
+            return None
+        if finding.get("category") == "security" and _is_plain_business_logic_line(
+            source, actual_line
+        ):
+            return None
+        if line != actual_line:
+            finding["line"] = actual_line
+            corrections.append({"reported_line": line, "verified_line": actual_line})
+    return corrections
+
+
+def _is_plain_business_logic_line(source: str, line: int) -> bool:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+
+    def plain_expression(node: ast.AST) -> bool:
+        if isinstance(node, (ast.Name, ast.Constant)):
+            return True
+        if isinstance(node, ast.BinOp):
+            return isinstance(
+                node.op,
+                (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+            ) and plain_expression(node.left) and plain_expression(node.right)
+        if isinstance(node, ast.Compare):
+            return (
+                plain_expression(node.left)
+                and all(plain_expression(item) for item in node.comparators)
+                and all(isinstance(
+                    operator,
+                    (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE),
+                ) for operator in node.ops)
+            )
+        return False
+
+    return any(
+        isinstance(node, ast.Return)
+        and node.lineno == line
+        and plain_expression(node.value)
+        for node in ast.walk(tree)
+    )
 
 
 def _bind_reviewer_evidence(
@@ -134,7 +238,10 @@ def _deduplicated_review_findings(
 ) -> list[dict[str, object]]:
     findings: list[Finding] = []
     for reviewer in _REVIEWER_STAGES.values():
-        parsed = reviewer_outputs.get(reviewer, {}).get("parsed")
+        output = reviewer_outputs.get(reviewer, {})
+        if output.get("status") != "completed":
+            continue
+        parsed = output.get("parsed")
         raw_findings = parsed.get("findings") if isinstance(parsed, Mapping) else None
         if not isinstance(raw_findings, list):
             continue
@@ -149,17 +256,52 @@ def _deduplicated_review_findings(
     ]
 
 
+def _reviewer_attributions(
+    reviewer_outputs: Mapping[str, Mapping[str, object]],
+) -> dict[tuple[object, ...], list[str]]:
+    attributions: dict[tuple[object, ...], list[str]] = {}
+    for reviewer in _REVIEWER_STAGES.values():
+        output = reviewer_outputs.get(reviewer, {})
+        parsed = output.get("parsed")
+        raw_findings = parsed.get("findings") if isinstance(parsed, Mapping) else None
+        if output.get("status") != "completed" or not isinstance(raw_findings, list):
+            continue
+        for raw_finding in raw_findings:
+            if not isinstance(raw_finding, Mapping):
+                continue
+            finding = Finding.model_validate(raw_finding)
+            key = (
+                finding.file,
+                finding.line,
+                finding.description.strip().casefold(),
+                finding.severity,
+                finding.status,
+                finding.fix,
+            )
+            attributions.setdefault(key, []).append(reviewer)
+    return attributions
+
+
 def _bind_synthesized_evidence(
     report: Mapping[str, object],
     reviewer_outputs: Mapping[str, Mapping[str, object]],
-) -> dict[str, object]:
+    source_contents: Mapping[str, str],
+) -> tuple[dict[str, object], list[dict[str, int]] | None]:
     normalized = dict(report)
     findings = report.get("findings")
     if not isinstance(findings, list):
-        return normalized
+        return normalized, None
+    normalized_findings = [
+        dict(finding) if isinstance(finding, Mapping) else finding
+        for finding in findings
+    ]
+    line_corrections = _correct_finding_lines(normalized_findings, source_contents)
     trusted_references: dict[str, tuple[object, object]] = {}
     for reviewer in _REVIEWER_STAGES.values():
-        parsed = reviewer_outputs.get(reviewer, {}).get("parsed")
+        output = reviewer_outputs.get(reviewer, {})
+        if output.get("status") != "completed":
+            continue
+        parsed = output.get("parsed")
         if not isinstance(parsed, Mapping) or not isinstance(parsed.get("findings"), list):
             continue
         for finding in parsed["findings"]:
@@ -168,22 +310,22 @@ def _bind_synthesized_evidence(
                     finding.get("tool_reference"),
                     finding.get("test_reference"),
                 )
-    normalized_findings: list[object] = []
-    for finding in findings:
+    for index, finding in enumerate(normalized_findings):
         if not isinstance(finding, Mapping):
-            normalized_findings.append(finding)
             continue
         item = dict(finding)
         references = trusted_references.get(_finding_content_key(item))
         item["tool_reference"] = references[0] if references else None
         item["test_reference"] = references[1] if references else None
-        normalized_findings.append(item)
+        normalized_findings[index] = item
     normalized["findings"] = normalized_findings
-    return normalized
+    return normalized, line_corrections
 
 
 def _reviewer_outputs(
-    result: object, *, requested_files: Sequence[object] = ()
+    result: object,
+    *,
+    requested_files: Sequence[object] = (),
 ) -> dict[str, dict[str, object]]:
     messages = getattr(result, "messages", None)
     test_runner_status = extract_test_runner_status(result)
@@ -196,6 +338,10 @@ def _reviewer_outputs(
     if isinstance(messages, list):
         read_references = {
             reviewer: _read_tool_references(messages, reviewer)
+            for reviewer in _REVIEWER_STAGES.values()
+        }
+        read_sources = {
+            reviewer: _read_tool_sources(messages, reviewer)
             for reviewer in _REVIEWER_STAGES.values()
         }
         for message in messages:
@@ -213,18 +359,23 @@ def _reviewer_outputs(
                     parsed_output = extract_reviewer_report(
                         content, expected_category=category
                     )
-                except ValueError:
+                except ValueError as error:
                     outputs[source] = {
                         "status": "unavailable",
                         "content": _stored_content(content),
+                        "error": f"{type(error).__name__}: {error}",
                     }
                     continue
                 parsed_findings = parsed_output.get("findings")
+                line_corrections = _correct_finding_lines(
+                    parsed_findings, read_sources[source]
+                )
                 if (
                     not requested_paths
                     or not requested_paths <= set(read_references[source])
                     or not set(read_references[source]) <= requested_paths
                     or not isinstance(parsed_findings, list)
+                    or line_corrections is None
                     or any(
                         not isinstance(finding, Mapping)
                         or finding.get("file") not in requested_paths
@@ -237,6 +388,11 @@ def _reviewer_outputs(
                         "parsed": _bind_reviewer_evidence(
                             parsed_output, read_references[source]
                         ),
+                        "error": (
+                            "Reviewer did not read exactly the requested source files "
+                            "or returned an unsupported finding line, excerpt, or "
+                            "security classification."
+                        ),
                     }
                     continue
                 parsed_output = _bind_reviewer_evidence(
@@ -247,15 +403,18 @@ def _reviewer_outputs(
                     "content": _stored_content(content),
                     "parsed": parsed_output,
                 }
+                if line_corrections:
+                    outputs[source]["line_corrections"] = line_corrections
             elif source == "TestAnalyst":
                 if not isinstance(content, (str, Mapping, BaseModel)):
                     continue
                 try:
                     parsed_output = extract_test_analyst_report(content)
-                except ValueError:
+                except ValueError as error:
                     outputs[source] = {
                         "status": "unavailable",
                         "content": _stored_content(content),
+                        "error": f"{type(error).__name__}: {error}",
                     }
                     continue
                 valid_test_result = (
@@ -269,11 +428,18 @@ def _reviewer_outputs(
                     "test_runner_status": test_runner_status,
                     "parsed": parsed_output,
                 }
+                if not valid_test_result:
+                    outputs[source]["error"] = (
+                        "TestAnalyst status does not match an available test-runner result."
+                    )
             else:
                 outputs[source] = {
                     "status": "unavailable",
                     "content": _stored_content(content),
                 }
+    for name in _REVIEWER_NAMES:
+        if outputs[name]["content"] is None and "error" not in outputs[name]:
+            outputs[name]["error"] = "No response was produced by this agent."
     return outputs
 
 
@@ -444,6 +610,98 @@ def _pipeline_checks_complete(pipeline_result: Mapping[str, object] | None) -> b
     )
 
 
+def _test_counts(test_results: object) -> tuple[int, int]:
+    if not isinstance(test_results, Mapping):
+        return 0, 0
+    output = "\n".join(
+        value for value in (test_results.get("stdout"), test_results.get("stderr"))
+        if isinstance(value, str)
+    )
+    passed = re.search(r"\b(\d+)\s+passed\b", output)
+    failed = re.search(r"\b(\d+)\s+failed\b", output)
+    return (
+        int(passed.group(1)) if passed else 0,
+        int(failed.group(1)) if failed else 0,
+    )
+
+
+def _review_result(
+    request: Mapping[str, object],
+    *,
+    stages: Mapping[str, object],
+    test_results: object,
+    reviewer_outputs: Mapping[str, Mapping[str, object]],
+    autogen_report: Mapping[str, object] | None,
+    missing_files: Sequence[object],
+    release: Mapping[str, object],
+    evidence_validation: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the assignment's strict ReviewResult alongside diagnostic details."""
+    tests_passed, tests_failed = _test_counts(test_results)
+    reviewer_findings = _deduplicated_review_findings(reviewer_outputs)
+    missing_checks = list(release.get("missing_checks", []))
+    complete = (
+        all(_status(stages.get(name)) in _COMPLETED_STATUSES for name in (
+            "source_scan", "correctness", "security", "testing"
+        ))
+        and not missing_files
+        and evidence_validation.get("verified") is True
+    )
+    release_decision = release["release_decision"]
+    if release_decision == "PASS" and (
+        not complete
+        or missing_checks
+        or release.get("blockers")
+        or any(
+            isinstance(finding, Mapping)
+            and finding.get("status") == "unverified"
+            for finding in reviewer_findings
+        )
+    ):
+        release_decision = "NEEDS_HUMAN_REVIEW"
+        missing_checks.append(
+            "Report consistency checks do not support a PASS decision."
+        )
+    if missing_files:
+        summary = (
+            "Review was not completed because requested source files are missing: "
+            + ", ".join(str(path) for path in missing_files)
+            + "."
+        )
+    elif autogen_report is not None:
+        summary_value = autogen_report.get("reviewer_summary")
+        summary = (
+            summary_value.strip()
+            if isinstance(summary_value, str) and summary_value.strip()
+            else "The reviewer synthesis did not provide a usable summary."
+        )
+    else:
+        summaries = [
+            parsed["reviewer_summary"]
+            for output in reviewer_outputs.values()
+            if output.get("status") == "completed"
+            and isinstance((parsed := output.get("parsed")), Mapping)
+            and isinstance(parsed.get("reviewer_summary"), str)
+        ]
+        summary = " ".join(summaries) or (
+            "Reviewer synthesis is unavailable; the release decision is based on "
+            "the checks and evidence that completed."
+        )
+    result = ReviewResult.model_validate({
+        "review_id": request["review_id"],
+        "commit_id": request["commit_id"],
+        "scan_status": "complete" if complete else "incomplete",
+        "tests_passed": tests_passed,
+        "tests_failed": tests_failed,
+        "findings": reviewer_findings,
+        "release_decision": release_decision,
+        "blockers": release.get("blockers", []),
+        "missing_checks": list(dict.fromkeys(missing_checks)),
+        "reviewer_summary": summary,
+    })
+    return result.model_dump(mode="json")
+
+
 def _report(
     request: Mapping[str, object],
     pipeline_result: Mapping[str, object] | None,
@@ -504,9 +762,34 @@ def _report(
         _deduplicated_review_findings(reviewer_outputs),
         source="autogen",
     ))
+    reviewer_attributions = _reviewer_attributions(reviewer_outputs)
+    for finding in combined_findings:
+        if not isinstance(finding, dict) or finding.get("source") != "autogen":
+            continue
+        key = (
+            finding.get("file"),
+            finding.get("line"),
+            str(finding.get("description", "")).strip().casefold(),
+            finding.get("severity"),
+            finding.get("status"),
+            finding.get("fix"),
+        )
+        finding["reviewers"] = reviewer_attributions.get(key, [])
+
+    evidence_findings = list(combined_findings)
+    for reviewer in _REVIEWER_STAGES.values():
+        output = reviewer_outputs.get(reviewer, {})
+        if output.get("status") == "completed":
+            continue
+        parsed = output.get("parsed")
+        findings = parsed.get("findings") if isinstance(parsed, Mapping) else None
+        if isinstance(findings, list):
+            evidence_findings.extend(
+                finding for finding in findings if isinstance(finding, Mapping)
+            )
 
     evidence_validation = validate_findings(
-        combined_findings,
+        evidence_findings,
         allowed_references=_trusted_evidence_references(
             trusted_pipeline, reviewer_outputs
         ),
@@ -520,6 +803,8 @@ def _report(
         pipeline_test_results,
         reviewer_outputs.get("TestAnalyst", {}).get("test_status"),
     )
+    if missing_files:
+        test_status = "unavailable"
     findings_agree = False
     tests_agree = False
     if autogen_report is not None:
@@ -541,7 +826,6 @@ def _report(
             "status": (
                 "completed"
                 if reviewer_outputs.get(reviewer, {}).get("status") == "completed"
-                and findings_agree
                 and _pipeline_checks_complete(trusted_pipeline)
                 and not missing_files
                 else "unavailable"
@@ -550,22 +834,18 @@ def _report(
         for stage, reviewer in _REVIEWER_STAGES.items()
     })
     pipeline_test_status = _status(pipeline_test_results)
-    test_analyst_available = (
-        reviewer_outputs.get("TestAnalyst", {}).get("status") == "completed"
-    )
-    synthesized_test_available = (
-        reviewer_outputs.get("ReportSynthesizer", {}).get("status") == "completed"
-        and tests_agree
-    )
     testing_available = (
         pipeline_test_status in {"passed", "failed"}
-        and test_analyst_available
-        and reviewer_outputs.get("TestAnalyst", {}).get("test_status")
-        in {"passed", "failed"}
-        and synthesized_test_available
+        and not missing_files
     )
     stages["testing"] = {
         "status": "completed" if testing_available else "unavailable"
+    }
+    synthesis_available = (
+        reviewer_outputs.get("ReportSynthesizer", {}).get("status") == "completed"
+    )
+    stages["report_synthesis"] = {
+        "status": "completed" if synthesis_available else "unavailable"
     }
     release_results: dict[str, object] = {
         "stages": stages,
@@ -574,6 +854,40 @@ def _report(
         "evidence_validation": evidence_validation,
     }
     release = evaluate_release(release_results, policy)
+    if not synthesis_available and release["release_decision"] != "BLOCK":
+        release = {
+            **release,
+            "release_decision": "NEEDS_HUMAN_REVIEW",
+            "missing_checks": list(dict.fromkeys([
+                *release["missing_checks"],
+                "report_synthesis",
+            ])),
+            "decision_reasons": list(dict.fromkeys([
+                *release["decision_reasons"],
+                "The consolidated report synthesis is missing or unavailable.",
+            ])),
+        }
+
+    validated_report = _review_result(
+        request,
+        stages=stages,
+        test_results=pipeline_test_results,
+        reviewer_outputs=reviewer_outputs,
+        autogen_report=autogen_report,
+        missing_files=missing_files,
+        release=release,
+        evidence_validation=evidence_validation,
+    )
+    if validated_report["release_decision"] != release["release_decision"]:
+        release = {
+            **release,
+            "release_decision": validated_report["release_decision"],
+            "missing_checks": validated_report["missing_checks"],
+            "decision_reasons": list(dict.fromkeys([
+                *release["decision_reasons"],
+                "The canonical report safety checks require human review.",
+            ])),
+        }
 
     report: dict[str, object] = {
         "review_id": request["review_id"],
@@ -595,7 +909,8 @@ def _report(
         },
         "findings": combined_findings,
         "evidence_validation": evidence_validation,
-        "release_decision": release["release_decision"],
+        "release_decision": validated_report["release_decision"],
+        "validated_report": validated_report,
         "blockers": release["blockers"],
         "missing_checks": release["missing_checks"],
         "decision_reasons": release["decision_reasons"],
@@ -620,52 +935,109 @@ async def _review_request(
     except Exception as error:
         pipeline_error = _error_message(error)
 
-    autogen_report: Mapping[str, object] | None = None
+    autogen_report: dict[str, object] | None = None
     autogen_error: str | None = None
     reviewer_outputs: dict[str, dict[str, object]] = {
         name: {"status": "unavailable", "content": None}
         for name in _REVIEWER_NAMES
     }
-    try:
-        team_result = await run_review_team(request)
-        requested_files = request.get("files")
-        reviewer_outputs = _reviewer_outputs(
-            team_result,
-            requested_files=(
-                requested_files
-                if isinstance(requested_files, Sequence)
-                and not isinstance(requested_files, (str, bytes))
-                else ()
-            ),
+    missing_sources = (
+        pipeline_result.get("missing_files", [])
+        if pipeline_result is not None
+        else []
+    )
+    if not isinstance(missing_sources, Sequence) or isinstance(
+        missing_sources, (str, bytes)
+    ):
+        missing_sources = []
+    if missing_sources:
+        missing_source_message = (
+            "AutoGen review was not run because requested source files are missing: "
+            f"{', '.join(str(path) for path in missing_sources)}."
         )
-        reviewer_outputs["ReportSynthesizer"] = {
-            **reviewer_outputs["ReportSynthesizer"],
-            "status": "unavailable",
+        reviewer_outputs = {
+            name: {
+                "status": "unavailable",
+                "content": None,
+                "error": missing_source_message,
+            }
+            for name in _REVIEWER_NAMES
         }
-        autogen_report = _bind_synthesized_evidence(
-            extract_synthesized_report(team_result), reviewer_outputs
-        )
-        findings_agree, tests_agree = _synthesized_report_agrees(
-            autogen_report, reviewer_outputs
-        )
-        reviewer_outputs["ReportSynthesizer"] = {
-            **reviewer_outputs["ReportSynthesizer"],
-            "status": (
-                "completed"
-                if findings_agree
-                and tests_agree
-                and all(
-                    reviewer_outputs.get(name, {}).get("status") == "completed"
-                    for name in (
-                        *_REVIEWER_STAGES.values(),
-                        "TestAnalyst",
-                    )
+    else:
+        try:
+            team_result = await run_review_team(request)
+            requested_files = request.get("files")
+            reviewer_outputs = _reviewer_outputs(
+                team_result,
+                requested_files=(
+                    requested_files
+                    if isinstance(requested_files, Sequence)
+                    and not isinstance(requested_files, (str, bytes))
+                    else ()
+                ),
+            )
+            messages = getattr(team_result, "messages", [])
+            source_contents = {
+                path: content
+                for reviewer in _REVIEWER_STAGES.values()
+                for path, content in _read_tool_sources(messages, reviewer).items()
+            } if isinstance(messages, list) else {}
+            reviewer_outputs["ReportSynthesizer"] = {
+                **reviewer_outputs["ReportSynthesizer"],
+                "status": "unavailable",
+            }
+            autogen_report, synthesized_line_corrections = _bind_synthesized_evidence(
+                extract_synthesized_report(team_result),
+                reviewer_outputs,
+                source_contents,
+            )
+            if synthesized_line_corrections:
+                reviewer_outputs["ReportSynthesizer"]["line_corrections"] = (
+                    synthesized_line_corrections
                 )
-                else "unavailable"
-            ),
-        }
-    except Exception as error:
-        autogen_error = _error_message(error)
+            findings_agree, tests_agree = _synthesized_report_agrees(
+                autogen_report, reviewer_outputs
+            )
+            reviewer_outputs["ReportSynthesizer"] = {
+                **reviewer_outputs["ReportSynthesizer"],
+                "status": (
+                    "completed"
+                    if findings_agree
+                    and tests_agree
+                    and all(
+                        reviewer_outputs.get(name, {}).get("status") == "completed"
+                        for name in (
+                            *_REVIEWER_STAGES.values(),
+                            "TestAnalyst",
+                        )
+                    )
+                    else "unavailable"
+                ),
+            }
+            if reviewer_outputs["ReportSynthesizer"]["status"] != "completed":
+                reviewer_outputs["ReportSynthesizer"]["error"] = (
+                    "Synthesized output did not agree with the available structured "
+                    "reviewer findings and test results."
+                )
+        except Exception as error:
+            autogen_error = _error_message(error)
+            reviewer_outputs = {
+                name: (
+                    {
+                        **output,
+                        "status": "unavailable",
+                        "error": output.get("error") or autogen_error,
+                    }
+                    if output.get("content") is None
+                    else output
+                )
+                for name, output in reviewer_outputs.items()
+            }
+            reviewer_outputs["ReportSynthesizer"] = {
+                **reviewer_outputs["ReportSynthesizer"],
+                "status": "unavailable",
+                "error": autogen_error,
+            }
 
     return _report(
         request,
@@ -684,10 +1056,13 @@ async def _run_requests(
     policy: Mapping[str, object],
     policy_error: str | None,
 ) -> list[dict[str, object]]:
-    reports = []
-    for request in requests:
-        reports.append(await _review_request(request, policy, policy_error))
-    return reports
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REVIEWS)
+
+    async def review(request: Mapping[str, object]) -> dict[str, object]:
+        async with semaphore:
+            return await _review_request(request, policy, policy_error)
+
+    return list(await asyncio.gather(*(review(request) for request in requests)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -696,10 +1071,18 @@ def main(argv: list[str] | None = None) -> int:
         description="Review repository changes and evaluate release readiness."
     )
     parser.add_argument("request_file", help="Path to a JSON request batch.")
+    parser.add_argument(
+        "--review-id",
+        help="Review only the request with this ID instead of the full batch.",
+    )
     args = parser.parse_args(argv)
 
     try:
-        requests = load_requests(args.request_file)
+        requests = (
+            [load_request(args.request_file, args.review_id)]
+            if args.review_id
+            else load_requests(args.request_file)
+        )
     except (OSError, ValueError) as error:
         print(json.dumps({"error": _error_message(error), "reports": []}, indent=2))
         return 2

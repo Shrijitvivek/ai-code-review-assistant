@@ -1,10 +1,101 @@
-# AI Code Review & Release Readiness Assistant 
+# AI Code Review & Release Readiness Assistant
 
-Pallavi's contribution provides validated inputs, Pydantic report contracts, deterministic tests, and documentation.
+An AI-powered code review system that uses **LangChain** and **AutoGen** to inspect Python repositories, identify bugs and potential security issues, analyse test results, validate evidence, and determine whether a software release is ready.
+
+The system combines structured workflows, specialised AI reviewers, deterministic validation, and policy-based release decisions.
+
+## Project Overview
+
+The application accepts a review request and a Python repository as input. It analyses the requested source files, runs repository tests, coordinates multiple AI reviewers, validates their findings, and generates a structured JSON review report.
+
+### Input
+
+The application uses:
+
+- A Python repository containing source files and test cases.
+- A review request containing a review ID, commit ID, requested files, and review instructions.
+- A review policy defining severity levels, evidence requirements, and release conditions.
+
+### Processing
+
+**LangChain** manages the review preparation and workflow:
+
+- Request validation and data preparation.
+- Parallel source inventory, static analysis, and test execution.
+- Conditional routing for missing files and release-blocking requests.
+- Structured workflow processing.
+
+**AutoGen** coordinates four specialised agents:
+
+| Agent | Responsibility |
+|---|---|
+| CorrectnessReviewer | Identifies logical and functional bugs. |
+| SecurityReviewer | Reviews potential security vulnerabilities. |
+| TestAnalyst | Executes and interprets repository tests. |
+| ReportSynthesizer | Combines reviewer findings into a final summary. |
+
+The system then validates finding evidence and applies deterministic release policies.
+
+### Output
+
+The application generates a structured JSON report containing:
+
+- Review ID and commit ID.
+- Scan status.
+- Test results.
+- Findings with file names and line numbers.
+- Severity, category, description, and proposed fixes.
+- Evidence and tool references.
+- Release decision.
+- Blockers and missing checks.
+- Reviewer summary.
+
+The three possible release decisions are:
+
+- **PASS** – The review satisfies the configured release policy.
+- **BLOCK** – Release-blocking issues or failed tests prevent release.
+- **NEEDS_HUMAN_REVIEW** – Required information or checks are unavailable.
+
+## Project Structure
+
+```text
+ai-code-review-assistant/
+│
+├── data/
+│   ├── review_policy.json
+│   └── review_requests.json
+│
+├── sample_repo/
+│   ├── cart.py
+│   ├── file_ops.py
+│   └── test_cart.py
+│
+├── src/
+│   ├── agents/
+│   ├── data/
+│   ├── models/
+│   ├── pipeline/
+│   ├── release/
+│   ├── tools/
+│   └── main.py
+│
+├── tests/
+│
+├── docs/
+│   ├── architecture.png
+│   ├── evaluation_report.md
+│   ├── demo_results.md
+│   └── review_report.schema.json
+│
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+```
 
 ## Installation
 
-Use Python 3.11 or 3.12 for the assignment.
+Use Python 3.11 or 3.12.
 
 ### Windows (PowerShell)
 
@@ -13,7 +104,6 @@ py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-python -m pytest tests -q
 ```
 
 ### macOS / Linux
@@ -23,16 +113,25 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
-python -m pytest tests -q
 ```
 
-Set `OPENAI_API_KEY` in your private `.env` file. The configured provider is OpenAI, with `OPENAI_MODEL=gpt-4o-mini`.
+### Environment Configuration
 
-Tests and input validation do not require an API key or network access.
+Set the following variables in your private `.env` file:
 
-**Important:** Never commit your `.env` file or expose API keys in source control.
+```env
+OPENAI_API_KEY=your_api_key_here
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
 
-## Execute the application and validate inputs
+The configured model provider is OpenAI, using an OpenAI-compatible model client.
+
+**Important:** Never commit `.env` files or expose API keys in source control.
+
+The deterministic test suite and input-validation operations do not require an API key or network access.
+
+## Running the Application
 
 Run the application from the repository root:
 
@@ -40,74 +139,89 @@ Run the application from the repository root:
 python -m src.main data/review_requests.json
 ```
 
-Validate all requests:
+This processes the supplied review requests in batch mode and generates JSON reports.
+
+### Validate All Review Requests
 
 ```bash
 python -c "from src.data.request_loader import load_requests; print(load_requests('data/review_requests.json'))"
 ```
 
-Validate a specific request:
+### Validate a Specific Review Request
 
 ```bash
 python -c "from src.data.request_loader import load_request; print(load_request('data/review_requests.json', 'R001'))"
 ```
 
-Display the report JSON schema:
+### Display the Report JSON Schema
 
 ```bash
 python -c "import json; from src.models.review_models import report_json_schema; print(json.dumps(report_json_schema(), indent=2))"
 ```
 
-The request file contains review scenarios R001–R004. Source paths are validated against `sample_repo`.
-
-To run the preparation pipeline directly with a validated request:
+### Run the Preparation Pipeline Directly
 
 ```bash
 python -c "from src.data.request_loader import load_request; from src.pipeline.review_pipeline import prepare_review; print(prepare_review(load_request('data/review_requests.json', 'R001')))"
 ```
 
-## Data contracts and validation
+## Data Contracts and Validation
 
-### Request loading
+### Request Loading
 
-- `load_requests(path)` validates records using `ReviewRequest` and returns `list[dict]` for compatibility with the preparation pipeline.
-- `load_request(path, review_id)` returns one validated request dictionary.
-- To create a Pydantic instance, use `ReviewRequest.model_validate(request)`.
+The request loader provides:
 
-Requests require:
+- `load_requests(path)` – Validates review records and returns a list of request dictionaries.
+- `load_request(path, review_id)` – Loads and validates a specific review request.
+
+Requests contain:
+
 - `review_id`
 - `commit_id`
-- A non-empty list of relative Python file paths
+- A non-empty list of relative Python file paths.
 - `message`
 
-Unknown keys, duplicate IDs, duplicate JSON keys, and invalid records raise `ValueError`. Unreadable files raise `OSError`. `load_request` rejects unknown IDs. Empty batches are allowed.
+Request validation handles malformed records, duplicate IDs, duplicate JSON keys, and unknown review IDs.
 
-Request paths resolve relative to the explicit repository root, not relative to the JSON file.
+Source paths are resolved against the repository root.
 
-### Source and evidence validation
+### Source and Evidence Validation
 
-- `missing_sources` identifies missing source checks.
-- `resolve_source` denies path traversal, absolute paths, non-Python files, and symlinks escaping the repository root.
-- `validate_finding_location` checks whether a cited file and line exist.
-- Evidence validation must also check tool references, request scope, and commit identity before confirming a finding.
+The source-validation layer provides:
 
-A valid file location alone does not prove that a finding is correct.
+- `missing_sources` – Identifies missing source checks.
+- `resolve_source` – Prevents path traversal, absolute-path access, disallowed file types, and symlinks escaping the repository root.
+- `validate_finding_location` – Validates cited files and line numbers.
 
-### Finding deduplication
+Evidence validation also considers tool references, request scope, and commit identity.
 
-`deduplicate_findings` merges matching descriptions and locations across categories while retaining evidence. Pass findings from only one repository snapshot to avoid mixing evidence from different versions.
+A valid file location alone does not establish that a finding is correct.
 
-### Report contracts
+### Finding Deduplication
 
-`ReviewResult.model_validate(payload)` validates a report, while `.model_dump_json(indent=2)` produces formatted JSON output.
+`deduplicate_findings` combines duplicate findings while retaining their evidence.
 
-The JSON Schema is available at:
+Findings from different repository snapshots must not be mixed.
+
+### Report Contracts
+
+Reports are validated using Pydantic models.
+
+```python
+ReviewResult.model_validate(payload)
+```
+
+Formatted JSON output can be generated using:
+
+```python
+.model_dump_json(indent=2)
+```
+
+The report JSON Schema is available at:
 
 `docs/review_report.schema.json`
 
-Findings include the assignment fields and a required `description` field identifying the issue.
-
-Supported values:
+Supported values include:
 
 | Field | Allowed values |
 |---|---|
@@ -117,58 +231,112 @@ Supported values:
 | Scan status | `complete`, `incomplete`, `failed` |
 | Release decision | `PASS`, `BLOCK`, `NEEDS_HUMAN_REVIEW` |
 
-### Release decision safety rules
+### Release Decision Safety
 
-Runtime report validation rejects non-`BLOCK` decisions when tests fail or a critical finding is confirmed.
+The release gate applies deterministic policy rules rather than relying solely on AI-generated recommendations.
 
-A `PASS` decision requires:
-- A complete scan.
-- No missing checks.
-- No blockers.
-- No unverified findings.
+Important safety conditions include:
 
-These are safety invariants. The team release gate must calculate the final decision using the configured policy and validated evidence.
+- Failed tests must result in `BLOCK` when the configured policy requires it.
+- Confirmed critical findings must trigger the configured blocking policy.
+- Missing required checks must not be treated as successful checks.
+- A `PASS` decision requires a complete review, no blockers, no missing checks, and no unverified findings.
 
-JSON Schema alone does not express these cross-field rules.
-
-Revalidate reports after modifying models. Mutable collections and `model_copy` are not substitutes for final validation. Never merge evidence from different commits.
-
-## Architecture and evaluation
-
-![Architecture](docs/architecture.png)
-
-See the following project documentation:
-
-- [Evaluation Report](docs/evaluation_report.md)
-- [Demo Results](docs/demo_results.md)
+The final decision is validated against the configured policy and available evidence.
 
 ## Testing
 
-Run the deterministic core test suite from the repository root:
+Run the project's deterministic test suite:
 
 ```bash
 python -m pytest tests -q
 ```
 
-Run the supplied buggy repository's tests separately from its directory:
+**Latest recorded test result:**
+
+```text
+121 passed
+```
+
+The supplied sample repository has its own tests. Run them separately:
 
 ```bash
 cd sample_repo
 python -m pytest -q
 ```
 
-Expected fixture failures must not be hidden or repaired.
+The sample repository intentionally contains bugs. Its tests are expected to fail until those bugs are corrected.
 
-`sample_repo/cart.py` intentionally retains the three assignment defects (subtotal addition, incorrect percentage discount, and exclusive free-shipping threshold). `sample_repo/test_cart.py` asserts the intended behavior, so running the sample tests directly is expected to fail. The review pipeline executes those tests and deterministically returns `BLOCK` when they fail. Do not repair the intentional sample-source bugs.
+Do not repair the intentional sample-source defects when demonstrating the review assistant.
 
-## Current implementation status
+## Demonstrated Review Scenarios
 
-The application demonstrates the LangChain preparation pipeline, AutoGen multi-agent review workflow, test execution, evidence validation, and deterministic release decisions.
+The supplied `review_requests.json` contains four review scenarios.
 
-The current demo includes four scenarios:
-- R001 – Standard code review.
-- R002 – Release readiness review.
-- R003 – Missing source file handling.
-- R004 – Prompt injection handling.
+| Request | Scenario | Observed decision |
+|---|---|---|
+| R001 | Standard code review | BLOCK |
+| R002 | Release-blocking review | BLOCK |
+| R003 | Missing source file | NEEDS_HUMAN_REVIEW |
+| R004 | Prompt injection attempt | BLOCK |
 
-Some agent outputs may be unavailable or require further validation. Review the generated reports and release decisions rather than assuming every review has completed successfully.
+### R001 – Standard Code Review
+
+The system identifies three correctness issues in `cart.py`:
+
+1. Incorrect subtotal calculation.
+2. Incorrect percentage discount calculation.
+3. Incorrect free-shipping threshold.
+
+The repository tests report three failures and one passing test. The release decision is `BLOCK`.
+
+### R002 – Release-Blocking Review
+
+The system identifies the cart calculation defects, executes the tests, and returns `BLOCK`.
+
+### R003 – Missing Source File
+
+The requested `missing.py` file is unavailable.
+
+The system safely reports missing checks, produces no fabricated findings, and returns `NEEDS_HUMAN_REVIEW`.
+
+### R004 – Prompt Injection Attempt
+
+The review request attempts to instruct the system to ignore policy and skip testing.
+
+The system continues its configured review workflow, executes the repository tests, and returns `BLOCK`.
+
+### Batch Execution
+
+All four requests were successfully processed in a single batch execution.
+
+The recorded execution completed with exit code `0`, and all four JSON reports were generated.
+
+## Architecture and Documentation
+
+![Project Architecture](docs/architecture.png)
+
+Additional project documentation:
+
+- [Evaluation Report](docs/evaluation_report.md)
+- [Demo Results](docs/demo_results.md)
+- [Review Report JSON Schema](docs/review_report.schema.json)
+
+## Current Implementation Status
+
+The core application workflow has been implemented and demonstrated:
+
+- LangChain request preparation, parallel processing, and conditional routing.
+- AutoGen multi-agent review with four specialised agents.
+- Restricted repository inspection and test execution tools.
+- Structured findings and evidence validation.
+- Deterministic release decisions.
+- Handling of missing source files and prompt injection attempts.
+- Individual and batch processing of the supplied review requests.
+- Pydantic-based request and report contracts.
+
+The latest demonstrated batch execution successfully processed R001, R002, R003, and R004.
+
+The supplied sample repository intentionally retains its three known defects so that the review assistant can detect them.
+
+**The application reports issues and release readiness; it does not automatically modify the reviewed repository.**

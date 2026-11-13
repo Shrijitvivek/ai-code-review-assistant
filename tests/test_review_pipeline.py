@@ -29,6 +29,9 @@ def test_valid_request_returns_review_result() -> None:
     assert result["route"] == "standard_review_handling"
     assert result["action"] == "perform_standard_review"
     assert set(result["checks"]) == {"inventory", "static_analysis", "test_results"}
+    assert result["checks"]["test_results"]["status"] == "failed"
+    assert result["checks"]["test_results"]["return_code"] != 0
+    assert "failed" in result["checks"]["test_results"]["stdout"]
     assert "release_decision" in result
     assert "evidence_validation" in result
 

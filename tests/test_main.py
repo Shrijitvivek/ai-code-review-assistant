@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from src import main as cli
@@ -21,7 +22,7 @@ def _pipeline_result(
     static_findings = [
         {
             "file": "cart.py",
-            "line": 1,
+            "line": 5,
             "rule": "example-rule",
             "message": "Static-analysis observation.",
         }
@@ -41,7 +42,17 @@ def _pipeline_result(
                 "status": "completed",
                 "findings": static_findings,
             },
-            "test_results": {"status": test_status, "return_code": 0},
+            "test_results": {
+                "status": test_status,
+                "return_code": 1 if test_status == "failed" else 0,
+                "stdout": (
+                    "4 failed in 0.01s"
+                    if test_status == "failed"
+                    else "4 passed in 0.01s"
+                    if test_status == "passed"
+                    else ""
+                ),
+            },
         },
         "release_decision": "PASS",
     }
@@ -56,13 +67,18 @@ def _autogen_result(
     include_test_analyst=True,
     valid=True,
 ):
+    source_content = (
+        Path(__file__).resolve().parents[1] / "sample_repo" / "cart.py"
+    ).read_text(encoding="utf-8")
     agent_finding = {
         "file": "cart.py",
-        "line": 1,
+        "line": 5,
         "category": "correctness",
         "severity": "LOW",
         "description": "AutoGen observation.",
-        "evidence": ["read_repository_file(cart.py): source excerpt"],
+        "evidence": [
+            "Source line: return price + quantity"
+        ],
         "status": "confirmed",
         "fix": "Review the cited behavior.",
         "tool_reference": "read_repository_file:cart.py",
@@ -131,7 +147,7 @@ def _autogen_result(
                     content=json.dumps({
                         "status": "ok",
                         "path": "cart.py",
-                        "content": "source excerpt from cart.py",
+                        "content": source_content,
                         "tool_reference": "read_repository_file:cart.py",
                     }),
                 )
@@ -189,6 +205,21 @@ def test_cli_combines_findings_and_both_test_results(monkeypatch, tmp_path, caps
     assert report["checks"]["stages"]["correctness"]["status"] == "completed"
     assert report["checks"]["stages"]["security"]["status"] == "completed"
     assert report["release_decision"] == "PASS"
+    assert set(report["validated_report"]) == {
+        "review_id",
+        "commit_id",
+        "scan_status",
+        "tests_passed",
+        "tests_failed",
+        "findings",
+        "release_decision",
+        "blockers",
+        "missing_checks",
+        "reviewer_summary",
+    }
+    assert report["validated_report"]["release_decision"] == "PASS"
+    assert report["validated_report"]["tests_passed"] == 4
+    assert report["validated_report"]["tests_failed"] == 0
     assert set(report["autogen"]["reviewer_outputs"]) == {
         "CorrectnessReviewer",
         "SecurityReviewer",
@@ -209,7 +240,7 @@ def test_cli_does_not_complete_missing_reviewer_stage(monkeypatch, tmp_path, cap
 
     assert report["checks"]["stages"]["correctness"]["status"] == "completed"
     assert report["checks"]["stages"]["security"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "completed"
     assert report["autogen"]["reviewer_outputs"]["ReportSynthesizer"]["status"] == "unavailable"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
@@ -264,6 +295,35 @@ def test_cli_keeps_unavailable_requested_files_from_passing(
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
+def test_missing_requested_source_does_not_run_or_report_autogen_results(
+    monkeypatch, tmp_path, capsys
+):
+    team_calls = []
+    _configure_cli(
+        monkeypatch,
+        pipeline=lambda request: _pipeline_result(
+            missing_files=["missing.py"], findings=[]
+        ),
+        team=lambda request: team_calls.append(request),
+    )
+    path = _write_requests(tmp_path, _request(files=["missing.py"]))
+
+    assert cli.main([str(path)]) == 0
+    report = json.loads(capsys.readouterr().out)[0]
+
+    assert team_calls == []
+    assert report["findings"] == []
+    assert report["autogen"]["report"] is None
+    assert report["checks"]["autogen_test_status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["missing_files"] == ["missing.py"]
+    assert all(
+        output["status"] == "unavailable"
+        for output in report["autogen"]["reviewer_outputs"].values()
+    )
+    assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
+
+
 def test_missing_test_analyst_output_keeps_testing_unavailable(
     monkeypatch, tmp_path, capsys
 ):
@@ -277,7 +337,7 @@ def test_missing_test_analyst_output_keeps_testing_unavailable(
     report = json.loads(capsys.readouterr().out)[0]
 
     assert report["autogen"]["reviewer_outputs"]["TestAnalyst"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "completed"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -390,6 +450,68 @@ def test_invalid_reviewer_output_does_not_complete_its_stage(
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
+def test_reviewer_line_is_reconciled_to_the_quoted_source_line():
+    result = _autogen_result()
+    result.messages[0].content = json.dumps({
+        "findings": [{
+            **json.loads(result.messages[0].content)["findings"][0],
+            "line": 4,
+        }],
+        "reviewer_summary": "Reviewed correctness and reported the observed behavior.",
+    })
+
+    outputs = cli._reviewer_outputs(result, requested_files=["cart.py"])
+
+    assert outputs["CorrectnessReviewer"]["status"] == "completed"
+    assert outputs["CorrectnessReviewer"]["parsed"]["findings"][0]["line"] == 5
+    assert outputs["CorrectnessReviewer"]["line_corrections"] == [
+        {"reported_line": 4, "verified_line": 5}
+    ]
+
+
+def test_synthesized_line_is_reconciled_to_the_quoted_source_line(
+    monkeypatch, tmp_path, capsys
+):
+    def team(request):
+        result = _autogen_result()
+        synthesized = json.loads(result.messages[-1].content.removesuffix(
+            "\nREVIEW_COMPLETE"
+        ))
+        synthesized["findings"][0]["line"] = 4
+        result.messages[-1].content = (
+            json.dumps(synthesized) + "\nREVIEW_COMPLETE"
+        )
+        return result
+
+    _configure_cli(monkeypatch, team=team)
+    path = _write_requests(tmp_path, _request())
+
+    assert cli.main([str(path)]) == 0
+    report = json.loads(capsys.readouterr().out)[0]
+
+    assert report["autogen"]["reviewer_outputs"]["ReportSynthesizer"]["status"] == "completed"
+    assert report["autogen"]["reviewer_outputs"]["ReportSynthesizer"]["line_corrections"] == [
+        {"reported_line": 4, "verified_line": 5}
+    ]
+
+
+def test_security_reviewer_cannot_report_plain_business_logic():
+    result = _autogen_result()
+    result.messages[1].content = json.dumps({
+        "findings": [{
+            **json.loads(result.messages[0].content)["findings"][0],
+            "category": "security",
+            "description": "Arithmetic could produce an incorrect subtotal.",
+        }],
+        "reviewer_summary": "Reviewed requested code for security issues and found a concern.",
+    })
+
+    outputs = cli._reviewer_outputs(result, requested_files=["cart.py"])
+
+    assert outputs["SecurityReviewer"]["status"] == "unavailable"
+    assert "security classification" in outputs["SecurityReviewer"]["error"]
+
+
 def test_failed_tests_block_under_configured_policy(monkeypatch, tmp_path, capsys):
     _configure_cli(
         monkeypatch,
@@ -418,7 +540,7 @@ def test_test_analyst_requires_explicit_status(monkeypatch, tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)[0]
 
     assert report["autogen"]["reviewer_outputs"]["TestAnalyst"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "completed"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -437,7 +559,7 @@ def test_test_analyst_status_must_match_test_runner(monkeypatch, tmp_path, capsy
     report = json.loads(capsys.readouterr().out)[0]
 
     assert report["autogen"]["reviewer_outputs"]["TestAnalyst"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "completed"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -459,7 +581,7 @@ def test_test_analyst_cannot_complete_without_test_runner_output(
     report = json.loads(capsys.readouterr().out)[0]
 
     assert report["autogen"]["reviewer_outputs"]["TestAnalyst"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "completed"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -497,7 +619,8 @@ def test_synthesizer_test_status_must_agree_with_test_analyst(
     assert cli.main([str(path)]) == 0
     report = json.loads(capsys.readouterr().out)[0]
 
-    assert report["checks"]["stages"]["testing"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["testing"]["status"] == "completed"
+    assert report["checks"]["stages"]["report_synthesis"]["status"] == "unavailable"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -519,8 +642,9 @@ def test_synthesized_findings_must_agree_with_reviewer_findings(
     assert cli.main([str(path)]) == 0
     report = json.loads(capsys.readouterr().out)[0]
 
-    assert report["checks"]["stages"]["correctness"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["security"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["correctness"]["status"] == "completed"
+    assert report["checks"]["stages"]["security"]["status"] == "completed"
+    assert report["checks"]["stages"]["report_synthesis"]["status"] == "unavailable"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -529,11 +653,13 @@ def test_duplicate_reviewer_findings_are_deduplicated_across_categories(
 ):
     duplicate = {
         "file": "cart.py",
-        "line": 1,
+        "line": 2,
         "category": "security",
         "severity": "LOW",
         "description": "AutoGen observation.",
-        "evidence": ["second reviewer evidence"],
+        "evidence": [
+            "Second reviewer evidence: return Path(path).read_text()"
+        ],
         "status": "confirmed",
         "fix": "Review the cited behavior.",
         "tool_reference": "read_repository_file:cart.py",
@@ -541,6 +667,14 @@ def test_duplicate_reviewer_findings_are_deduplicated_across_categories(
 
     def team(request):
         result = _autogen_result()
+        result.messages[0].content = json.dumps({
+            "findings": [{
+                **json.loads(result.messages[0].content)["findings"][0],
+                "line": 2,
+                "evidence": ["Source line: return Path(path).read_text()"],
+            }],
+            "reviewer_summary": "Reviewed correctness and reported the observed behavior.",
+        })
         result.messages[1].content = json.dumps({
             "findings": [duplicate],
             "reviewer_summary": "Reviewed requested files for credible exploitable security issues.",
@@ -549,8 +683,8 @@ def test_duplicate_reviewer_findings_are_deduplicated_across_categories(
             "findings": [{
                 **json.loads(result.messages[0].content)["findings"][0],
                 "evidence": [
-                    "read_repository_file(cart.py): source excerpt",
-                    "second reviewer evidence",
+                    "Source line: return Path(path).read_text()",
+                    "Second reviewer evidence: return Path(path).read_text()",
                 ],
             }],
             "reviewer_summary": "Reviewers reconciled their duplicate source findings.",
@@ -559,6 +693,13 @@ def test_duplicate_reviewer_findings_are_deduplicated_across_categories(
         return result
 
     _configure_cli(monkeypatch, team=team)
+    monkeypatch.setattr(
+        cli,
+        "_read_tool_sources",
+        lambda messages, reviewer: {
+            "cart.py": "def read_text(path):\n    return Path(path).read_text()\n"
+        },
+    )
     path = _write_requests(tmp_path, _request())
 
     assert cli.main([str(path)]) == 0
@@ -570,6 +711,10 @@ def test_duplicate_reviewer_findings_are_deduplicated_across_categories(
     ]
     assert len(findings) == 1
     assert findings[0]["category"] == "correctness"
+    assert findings[0]["reviewers"] == [
+        "CorrectnessReviewer",
+        "SecurityReviewer",
+    ]
 
 
 def test_synthesizer_cannot_add_findings_not_reported_by_reviewers(
@@ -594,8 +739,9 @@ def test_synthesizer_cannot_add_findings_not_reported_by_reviewers(
     assert cli.main([str(path)]) == 0
     report = json.loads(capsys.readouterr().out)[0]
 
-    assert report["checks"]["stages"]["correctness"]["status"] == "unavailable"
-    assert report["checks"]["stages"]["security"]["status"] == "unavailable"
+    assert report["checks"]["stages"]["correctness"]["status"] == "completed"
+    assert report["checks"]["stages"]["security"]["status"] == "completed"
+    assert report["checks"]["stages"]["report_synthesis"]["status"] == "unavailable"
     assert report["release_decision"] == "NEEDS_HUMAN_REVIEW"
 
 
@@ -622,3 +768,24 @@ def test_cli_reports_missing_request_file_as_json(capsys, tmp_path):
 
     assert output["reports"] == []
     assert "FileNotFoundError" in output["error"]
+
+
+def test_cli_can_select_one_request_from_a_batch(monkeypatch, tmp_path, capsys):
+    def pipeline(request):
+        return {
+            **_pipeline_result(),
+            "review_id": request["review_id"],
+            "commit_id": request["commit_id"],
+        }
+
+    _configure_cli(monkeypatch, pipeline=pipeline)
+    path = _write_requests(
+        tmp_path,
+        _request(review_id="R001"),
+        _request(review_id="R002", commit_id="demo-b2"),
+    )
+
+    assert cli.main([str(path), "--review-id", "R002"]) == 0
+    reports = json.loads(capsys.readouterr().out)
+
+    assert [report["review_id"] for report in reports] == ["R002"]

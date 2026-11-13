@@ -21,6 +21,7 @@ from src.agents.review_team import (
 from src.agents.reviewers import CorrectnessReviewer, SecurityReviewer, TestAnalyst
 from src.agents.review_team import create_review_team
 from autogen_agentchat.messages import StructuredMessage
+from autogen_agentchat.agents import MessageFilterAgent
 from src.tools.repository_tools import read_repository_file, repository_read_tools
 from src.tools import test_runner
 from src.tools.test_runner import repository_test_tool
@@ -102,6 +103,31 @@ def test_review_team_registers_structured_agent_message_types() -> None:
     assert team._message_factory.is_registered(StructuredMessage[ReviewerReport])
     assert team._message_factory.is_registered(StructuredMessage[TestAnalystReport])
     assert team._message_factory.is_registered(StructuredMessage[SynthesizedReport])
+
+
+def test_reviewers_receive_only_their_own_outputs_and_synthesizer_gets_final_reports() -> None:
+    model_client = SimpleNamespace(model_info={"function_calling": True})
+
+    team = create_review_team(model_client)
+
+    participants = team._participants
+    assert all(isinstance(participant, MessageFilterAgent) for participant in participants)
+    assert [
+        participant._filter.per_source[1].source for participant in participants[:3]
+    ] == ["CorrectnessReviewer", "SecurityReviewer", "TestAnalyst"]
+    assert all(
+        participant._filter.per_source[1].count is None
+        for participant in participants[:3]
+    )
+    assert [
+        (rule.source, rule.position, rule.count)
+        for rule in participants[3]._filter.per_source
+    ] == [
+        ("user", "first", 1),
+        ("CorrectnessReviewer", "last", 1),
+        ("SecurityReviewer", "last", 1),
+        ("TestAnalyst", "last", 1),
+    ]
 
 
 def test_request_text_is_formatted_as_untrusted_json() -> None:

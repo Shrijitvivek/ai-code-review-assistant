@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
+from autogen_agentchat.agents import (
+    MessageFilterAgent,
+    MessageFilterConfig,
+    PerSourceFilter,
+)
+from autogen_agentchat.conditions import MaxMessageTermination, SourceMatchTermination
 from autogen_agentchat.messages import StructuredMessage
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -32,6 +38,8 @@ from src.agents.reviewers import (
 _DEFAULT_MODEL = "gpt-4o-mini"
 _DEFAULT_MAX_MESSAGES = 12
 _MAX_ALLOWED_MESSAGES = 48
+_MODEL_TIMEOUT_SECONDS = 20
+_TEAM_TIMEOUT_SECONDS = 75
 
 
 def _configured_message_limit(value: int | None = None) -> int:
@@ -68,6 +76,8 @@ def create_model_client() -> OpenAIChatCompletionClient:
         model=model,
         api_key=api_key,
         base_url=base_url,
+        timeout=_MODEL_TIMEOUT_SECONDS,
+        max_retries=0,
     )
 
 
@@ -82,15 +92,47 @@ def create_review_team(
     :func:`run_review_team` for a one-shot run with managed client cleanup.
     """
     message_limit = _configured_message_limit(max_messages)
-    termination = TextMentionTermination("REVIEW_COMPLETE") | MaxMessageTermination(
-        max_messages=message_limit
-    )
+    correctness = CorrectnessReviewer(model_client)
+    security = SecurityReviewer(model_client)
+    test_analyst = TestAnalyst(model_client)
+    synthesizer = ReportSynthesizer(model_client)
+
+    def independent_filter(source: str) -> MessageFilterConfig:
+        return MessageFilterConfig(per_source=[
+            PerSourceFilter(source="user", position="first", count=1),
+            PerSourceFilter(source=source),
+        ])
+    synthesis_filter = MessageFilterConfig(per_source=[
+        PerSourceFilter(source="user", position="first", count=1),
+        PerSourceFilter(source="CorrectnessReviewer", position="last", count=1),
+        PerSourceFilter(source="SecurityReviewer", position="last", count=1),
+        PerSourceFilter(source="TestAnalyst", position="last", count=1),
+    ])
+    termination = SourceMatchTermination(
+        sources=["ReportSynthesizer"]
+    ) | MaxMessageTermination(max_messages=message_limit)
     return RoundRobinGroupChat(
         participants=[
-            CorrectnessReviewer(model_client),
-            SecurityReviewer(model_client),
-            TestAnalyst(model_client),
-            ReportSynthesizer(model_client),
+            MessageFilterAgent(
+                name="CorrectnessReviewer",
+                wrapped_agent=correctness,
+                filter=independent_filter("CorrectnessReviewer"),
+            ),
+            MessageFilterAgent(
+                name="SecurityReviewer",
+                wrapped_agent=security,
+                filter=independent_filter("SecurityReviewer"),
+            ),
+            MessageFilterAgent(
+                name="TestAnalyst",
+                wrapped_agent=test_analyst,
+                filter=independent_filter("TestAnalyst"),
+            ),
+            MessageFilterAgent(
+                name="ReportSynthesizer",
+                wrapped_agent=synthesizer,
+                filter=synthesis_filter,
+            ),
         ],
         termination_condition=termination,
         custom_message_types=[
@@ -117,7 +159,7 @@ async def run_review_team(
     try:
         team = create_review_team(active_client, max_messages=max_messages)
         task = format_review_task(request)
-        return await team.run(task=task)
+        return await asyncio.wait_for(team.run(task=task), timeout=_TEAM_TIMEOUT_SECONDS)
     finally:
         if owns_client:
             await active_client.close()

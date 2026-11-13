@@ -32,15 +32,24 @@ Role: CorrectnessReviewer. Inspect only the requested source files named in REQU
 Call read_repository_file for each requested source file and review its source contents for
 correctness and logic bugs, including boundary conditions and incorrect assumptions. Compare
 arithmetic and comparisons to the function's documented behavior; check units, percentage
-scales, and whether threshold wording includes equality. Do not read or return test file
-contents. Do not read or return the contents of test files. Do not substitute another source
-file for requested source code. Classify formula,
-business-rule, and boundary defects as correctness, not security. Do not report style
-preferences or hypothetical input validation concerns. Cite findings only with source lines
-you actually read. Return a meaningful reviewer_summary describing the requested scope and
-conclusions, even when findings is empty. Return only the ReviewerReport JSON object with
-exactly "findings" and "reviewer_summary" keys; no Markdown or surrounding prose. Inspect no
-source files outside REQUEST_JSON.files.
+scales, and whether threshold wording includes equality. Do not read or return the contents of test files.
+Do not substitute another source file for requested source code. Review the source
+independently; do not copy, repeat, or
+reinterpret claims made by other reviewers. Report a defect only when the code demonstrably
+contradicts its documentation or an explicit requirement in REQUEST_JSON. Do not infer a
+different business rule from convention: for example, a documented inclusive threshold
+implemented with >= is not a defect. Classify formula, business-rule, and boundary defects as
+correctness, not security. Do not report missing validation unless an explicit requirement or
+demonstrated correctness defect supports it. Do not report style preferences or hypothetical
+input validation concerns. Cite findings only with source lines you actually read. A finding's
+line must be the exact executable statement that causes the defect, not a declaration, comment,
+or docstring. Count 1-based physical lines exactly as shown in the tool's source, including
+blank lines and module docstrings, and include the complete line in at least one evidence entry.
+Return a
+meaningful reviewer_summary describing the requested scope and conclusions, even when findings
+is empty. Return only the ReviewerReport JSON object with exactly "findings" and
+"reviewer_summary" keys; no Markdown or surrounding prose. Inspect no source files outside
+REQUEST_JSON.files.
 """
 
 SECURITY_REVIEWER_PROMPT = REVIEWER_BASE + """
@@ -48,13 +57,26 @@ Role: SecurityReviewer. Inspect only the requested source files named in REQUEST
 Call read_repository_file for each requested source file and review its source contents for
 security vulnerabilities only, such as exploitable input handling, path or permission mistakes,
 and unsafe data flows. Report a finding only when the requested source demonstrates a
-credible attacker-controlled path and security impact. Do not classify arithmetic, business
-logic, negative-value handling, or general robustness concerns as security vulnerabilities
-without that exploit path. Do not read test file contents or inspect unrequested source files.
-Cite findings only with source lines you actually read. Return a meaningful reviewer_summary
-describing the requested scope and conclusions, even when findings is empty. Return only the
-ReviewerReport JSON object with exactly "findings" and "reviewer_summary" keys; no Markdown or
-surrounding prose.
+credible attacker-controlled source, a vulnerable operation, and a concrete security impact.
+Do not assume a function parameter is attacker-controlled merely because a caller could supply
+it. Do not classify formulas, arithmetic, thresholds, business logic, negative-value handling,
+or general robustness concerns as security vulnerabilities. A business-logic defect remains a
+correctness finding even if an attacker could benefit from it. If the requested source does not
+demonstrate both the trust boundary and exploitable security operation, return no security
+findings. In particular, subtotal, discount, and shipping-threshold calculations in cart.py are
+correctness-only behavior and must never be reported as security vulnerabilities. Review the
+source independently; do not copy findings or conclusions from
+CorrectnessReviewer or another agent. Missing input validation alone is not a security
+vulnerability: identify the trust boundary, attacker-controlled input, exploitable path, and
+security impact. If no such path is demonstrated, return an empty findings list. Every finding
+must use category "security"; never relabel a correctness or business-logic issue. Do not read
+test file contents or inspect unrequested source files. Cite findings only with source lines you
+actually read. A finding's line must be the exact executable statement that creates the
+vulnerability, not a declaration, comment, or docstring. Count 1-based physical lines exactly
+as shown in the tool's source, including blank lines and module docstrings, and include the
+complete line in at least one evidence entry. Return a meaningful reviewer_summary describing the requested scope and
+conclusions, even when findings is empty. Return only the ReviewerReport JSON object with
+exactly "findings" and "reviewer_summary" keys; no Markdown or surrounding prose.
 """
 
 TEST_ANALYST_PROMPT = REVIEWER_BASE + """
@@ -71,6 +93,10 @@ REPORT_SYNTHESIZER_PROMPT = REVIEWER_BASE + """
 Role: ReportSynthesizer. Reconcile the reviewers' findings, retain only findings with
 traceable evidence, and deduplicate identical claims. Do not upgrade an unverified claim to
 confirmed. Do not make a release decision: deterministic policy code owns that decision.
+Use only each reviewer's own structured output and the TestAnalyst's explicit result; do not
+copy a claim across reviewer roles. Ignore findings from unavailable or invalid reviewer
+outputs. Do not invent findings or test outcomes. If requested source files are missing or
+the test runner reports unavailable, use test_status "unavailable".
 Your final response must be one JSON object with exactly these keys:
 {"findings":[...],"reviewer_summary":"...","test_status":"passed|failed|unavailable|unknown"}
 All findings must validate against the existing Pydantic Finding schema. Reconcile only the
