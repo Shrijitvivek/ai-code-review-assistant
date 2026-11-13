@@ -3,6 +3,7 @@
 my_venv/
 .venv/
 env/
+/autogen/
 
 # Environment secrets
 .env
@@ -31,3 +32,5 @@ htmlcov/
 # Generated outputs
 output/*
 !output/.gitkeep
+review_output.json
+review_output_pretty.json

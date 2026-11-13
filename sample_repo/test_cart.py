@@ -1,9 +1,17 @@
-from cart import Cart
+from cart import subtotal, apply_discount, free_shipping
 
 
-def test_cart_total() -> None:
-    cart = Cart()
-    cart.add_item("notebook", 3.5)
-    cart.add_item("pen", 1.5)
+def test_subtotal():
+    assert subtotal(100, 2) == 200
 
-    assert cart.total() == 5.0
+
+def test_apply_discount():
+    assert apply_discount(1000, 10) == 900
+
+
+def test_free_shipping_at_threshold():
+    assert free_shipping(1000) is True
+
+
+def test_free_shipping_below_threshold():
+    assert free_shipping(999) is False
